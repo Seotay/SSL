@@ -83,9 +83,6 @@ class Trainer:
                 loss.backward()
                 self.optimizer.step()
 
-            if self.scheduler is not None:
-                self.scheduler.step()
-
             total_loss += loss.item()
 
             preds = torch.argmax(outputs, dim=1).cpu().numpy()
@@ -93,7 +90,10 @@ class Trainer:
             all_labels.extend(labels.cpu().numpy())
 
             progress_bar.set_postfix(loss=f"{total_loss / step:.4f}")
-
+        
+        if self.scheduler is not None:
+            self.scheduler.step()
+            
         avg_loss = total_loss / len(self.trainloader)
         metrics = compute_metrics(all_labels, all_preds)
         return avg_loss, metrics

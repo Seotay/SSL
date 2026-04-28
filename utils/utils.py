@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
                              classification_report, confusion_matrix)
 def set_seed(seed):
@@ -62,3 +63,38 @@ def compute_metrics(y_true, y_pred):
 
     return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1,
                 "classification_report": report, "confusion_matrix": conf_matrix}
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.CE = nn.CrossEntropyLoss(reduction='none')
+        self.reduction = reduction
+
+        if alpha is not None:
+            if isinstance(alpha, (list, tuple)):
+                self.alpha = torch.tensor(alpha, dtype=torch.float32)
+            else:
+                self.alpha = float(alpha)
+        else:
+            self.alpha = None
+
+    def forward(self, inputs, targets):
+        ce_loss = self.CE(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+
+        if self.alpha is not None:
+            if isinstance(self.alpha, torch.Tensor):
+                alpha_t = self.alpha.to(inputs.device)[targets]
+                focal_loss = focal_loss * alpha_t
+            else:
+                focal_loss = focal_loss * self.alpha
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss

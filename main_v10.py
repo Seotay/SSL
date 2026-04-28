@@ -3,10 +3,10 @@ import logging
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch import optim
-from dataset.dataset_SL import get_wm811k
+from dataset.dataset import get_wm811k
 from model.model import ResnetModel
 from utils.utils import set_seed, EarlyStopping
-from utils.trainer_SL import Trainer
+from utils.trainer_v10 import Trainer
 
 
 
@@ -19,14 +19,15 @@ logging.basicConfig(
 
 if __name__ == "__main__":
     set_seed(42)
-    label_ratio = 0.05
+    label_ratio = 1.00
     batch_size = 256
     mu = 4
     epochs = 150
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_labeled_dataset, val_dataset, test_dataset = get_wm811k(
+    train_labeled_dataset, train_unlabeled_dataset, val_dataset, test_dataset = get_wm811k(
         labeled_path="./data/wm811k/preprocessing/labeled.pkl",
+        unlabeled_path="./data/wm811k/preprocessing/unlabeled.pkl",
         train_ratio=0.75,
         val_ratio=0.15,
         test_ratio=0.10,
@@ -34,12 +35,16 @@ if __name__ == "__main__":
         data_seed=0,
         label_ratio=label_ratio,
 
+        cutout_num_holes=4,
+        cutout_ratio=0.2,
+        noise_prob=0.05,
     )
     
 
     logger.info(f"train_labeled_dataset: {len(train_labeled_dataset)}")
     logger.info(f"val_dataset: {len(val_dataset)}")
     logger.info(f"test_dataset: {len(test_dataset)}")
+    logger.info(f"train_unlabeled_dataset: {len(train_unlabeled_dataset)}")
     
     
     labeled_trainloader = DataLoader(
@@ -51,6 +56,16 @@ if __name__ == "__main__":
         persistent_workers=True,
         drop_last=False
     )
+
+    unlabeled_trainloader = DataLoader(
+        train_unlabeled_dataset,
+        sampler=RandomSampler(train_unlabeled_dataset),
+        batch_size=batch_size * mu,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=False,
+    )
     
     val_loader = DataLoader(
         val_dataset,
@@ -60,22 +75,24 @@ if __name__ == "__main__":
         )
     test_loader = DataLoader(
         test_dataset,
-        sampler=SequentialSampler(test_dataset),    
+        sampler=SequentialSampler(test_dataset),
         batch_size=batch_size,
         drop_last=False
         )
     
-    model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=False).to(device)
-    early_stopping = EarlyStopping(patience=20, verbose=True, delta=0.0, path="./checkpoints/best_model.pt")
+    model = ResnetModel(num_classes=9).to(device)
+    early_stopping = EarlyStopping(patience=150, verbose=True, delta=0.0, path="./checkpoints/best_model.pt")
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     trainer = Trainer(
         model=model, 
-        trainloader=labeled_trainloader,
+        labeled_trainloader=labeled_trainloader, unlabeled_trainloader=unlabeled_trainloader,
         val_loader=val_loader, test_loader=test_loader,
         epochs=150,
-        optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping,        
+        optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping,
+        
+        lambda_u=1.0, rampup_epochs=30, temperature=1.0, threshold=0.90,
         use_amp=True, device=device)
 
     trainer.training()

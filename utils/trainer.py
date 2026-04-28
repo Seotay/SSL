@@ -113,10 +113,7 @@ class Trainer:
             else:
                 loss.backward()
                 self.optimizer.step()
-
-            if self.scheduler is not None:
-                self.scheduler.step()
-            
+             
             total_loss_x += loss_x.item()
             total_loss_u += loss_u.item()
             total_loss += loss.item()
@@ -128,6 +125,8 @@ class Trainer:
 
             progress_bar.set_postfix(total_loss=f"{total_loss / step:.4f}", loss_x=f"{total_loss_x / step:.4f}", 
                                      loss_u=f"{total_loss_u / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         avg_loss = total_loss / num_steps
         metrics = compute_metrics(all_labels, all_preds)
