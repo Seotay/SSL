@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from utils.utils import format_time, compute_metrics
 from tqdm import tqdm
 import time
+from optuna.exceptions import TrialPruned
 
 class Trainer:
     def __init__(self, model, labeled_trainloader, unlabeled_trainloader,
@@ -160,7 +161,6 @@ class Trainer:
         return avg_loss, metrics
 
 
-
     def _evaluate_and_log(self, data_loader, title):
         loss, metrics = self.evaluate(data_loader=data_loader, loader_name=f"{title} Evaluating...")
         print(f"[{title}] Loss: {loss:.4f}, " f"Acc: {metrics['accuracy']:.4f}, " f"Prec: {metrics['precision']:.4f}, " f"Rec: {metrics['recall']:.4f}, " f"F1: {metrics['f1']:.4f}")
@@ -183,3 +183,50 @@ class Trainer:
               f"Prec: {val_metrics['precision']:.4f}, "
               f"Rec: {val_metrics['recall']:.4f}, "
               f"F1: {val_metrics['f1']:.4f}")
+        
+
+class HyperbandTrainer(Trainer):
+    def __init__(self, *args, trial=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trial = trial
+
+
+    def training(self):
+
+        assert self.early_stopping is not None, "early_stopping must be provided."
+        assert self.val_loader is not None, "val_loader must be provided."
+        assert self.trial is not None, "Optuna trial must be provided for HyperbandTrainer."
+        
+        total_start = time.perf_counter()
+        best_val_f1 = -1.0
+        best_val_metrics = None
+
+        for epoch in range(self.epochs):
+            train_loss, train_metrics = self.train_one_epoch(epoch)
+            val_loss, val_metrics = self.evaluate(data_loader=self.val_loader, loader_name="Validation Evaluating...")
+            self._print_epoch_summary(epoch, train_loss, train_metrics, val_loss, val_metrics)
+
+            current_val_f1 = val_metrics["f1"]
+
+            if current_val_f1 > best_val_f1:
+                best_val_f1 = current_val_f1
+                best_val_metrics = val_metrics
+
+            self.trial.report(current_val_f1, step=epoch)
+            
+            if self.trial.should_prune():
+                print(f"Trial pruned at epoch {epoch + 1}")
+                raise TrialPruned()
+
+            self.early_stopping(current_val_f1, self.model)
+            if self.early_stopping.early_stop:
+                print("Early stopping triggered...")
+                break
+
+        self.early_stopping.load_best_model(self.model, self.device)
+        print("Loaded best model.")
+
+        total_time = time.perf_counter() - total_start
+        print(f"Hyperparameter Tuning time: {format_time(total_time)}")
+
+        return best_val_metrics

@@ -101,7 +101,7 @@ if __name__ == "__main__":
     #optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    focal_loss = FocalLoss(reduction="none", alpha=1, gamma=3.5)
+    focal_loss = FocalLoss(reduction="none", alpha=1, gamma=1.5)
 
     trainer = Trainer(
         model=model, 

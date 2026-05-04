@@ -1,22 +1,16 @@
-import torch
+﻿import torch
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import os
 from utils.utils import format_time, compute_metrics
 from tqdm import tqdm
 import time
 
+
 class Trainer:
     def __init__(self, model, labeled_trainloader, unlabeled_trainloader,
         val_loader, test_loader, epochs, optimizer, 
-        early_stopping=None, scheduler=None, lambda_u=1.0,
-        temperature=1.0, threshold=0.95,
-        
-        focal_loss=None, 
-        pseudo_label_plot_path="./figures/pseudo_label_number_by_iteration(focal_loss).png",        
-        use_amp=True, device=None
-        
+        early_stopping=None, device=None, scheduler=None, lambda_u=1.0, lambda_sk=0.5,
+        temperature=1.0, threshold=0.95, sinkhorn_loss_fn=None,
+        use_amp=True,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -31,19 +25,14 @@ class Trainer:
 
         # Hyperparameters for semi-supervised learning
         self.lambda_u = lambda_u
+        self.lambda_sk = lambda_sk
+        self.sinkhorn_loss_fn = sinkhorn_loss_fn
+
         self.temperature = temperature
         self.threshold = threshold
-
-        self.focal_loss = focal_loss
-        self.pseudo_label_plot_path = pseudo_label_plot_path
-
-        self.use_amp = use_amp
+        self.use_amp = use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        
-        self.pseudo_label_iterations = []
-        self.pseudo_label_counts = []
-        self.global_iteration = 0
-        self.num_classes = None
+
 
     @staticmethod
     def _next_batch(iterator, loader):
@@ -54,6 +43,19 @@ class Trainer:
             batch = next(iterator)
         return batch, iterator
     
+    def sinkhorn_div(self, logits_u_w, logits_u_s, temperature):
+        prob_u_w = torch.softmax(logits_u_w.detach() / temperature, dim=-1).float().contiguous() # [B*mu, num_classes]
+        prob_u_s = torch.softmax(logits_u_s / temperature, dim=-1).float().contiguous() # [B*mu, num_classes]
+
+        batch_size, num_classes = prob_u_w.shape
+
+        # Safer support for categorical classes
+        class_support = torch.eye(num_classes, device=prob_u_w.device, dtype=prob_u_w.dtype)
+        class_support = class_support.unsqueeze(0).expand(batch_size, num_classes, num_classes).contiguous() # [B*mu, num_classes, num_classes]
+
+        sinkhorn_loss = self.sinkhorn_loss_fn(prob_u_w, class_support, prob_u_s, class_support)
+        return sinkhorn_loss # [B*mu]
+
 
     def training(self):
         total_start = time.perf_counter()
@@ -70,7 +72,7 @@ class Trainer:
             if self.early_stopping.early_stop:
                 print("Early stopping triggered...")
                 break
-
+            
         # Computational time
         total_time = time.perf_counter() - total_start
         print(f"Total training time: {format_time(total_time)}")
@@ -84,7 +86,6 @@ class Trainer:
         self._evaluate_and_log(self.labeled_trainloader, "Best Model Train")
         self._evaluate_and_log(self.val_loader, "Best Model Validation")
         self._evaluate_and_log(self.test_loader, "Test")
-        self.plot_pseudo_label_distribution()
 
 
     def train_one_epoch(self, epoch=None):
@@ -93,7 +94,7 @@ class Trainer:
         unlabeled_iter = iter(self.unlabeled_trainloader)
         num_steps = min(len(self.labeled_trainloader), len(self.unlabeled_trainloader))
 
-        total_loss, total_loss_x, total_loss_u, total_mask_ratio = 0.0, 0.0, 0.0, 0.0
+        total_loss, total_loss_x, total_loss_u, total_sinkhorn_loss, total_mask_ratio = 0.0, 0.0, 0.0, 0.0, 0.0
         all_labels, all_preds = [], []
         
         desc = "Training" if epoch is None else f"Training {epoch + 1}/{self.epochs}"
@@ -113,7 +114,6 @@ class Trainer:
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits_labeled_x, logits_u_s = self.model(labeled_x), self.model(inputs_u_s)
                 loss_x = F.cross_entropy(logits_labeled_x, label)
-                #loss_x = self.focal_loss(logits_labeled_x, label).mean()
                 
                 with torch.no_grad():
                     logits_u_w = self.model(inputs_u_w) # [B*mu, num_classes]
@@ -121,20 +121,10 @@ class Trainer:
                     max_probs, pesudo_labels = torch.max(prob_u_w, dim=-1) # max_probs: [B*mu, 1], pesudo_labels: [B*mu, 1]
                     mask = max_probs.ge(self.threshold).float() # [B*mu, 1]: True / False
 
-                    if self.num_classes is None:
-                        self.num_classes = logits_u_w.size(-1)
+                loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
+                loss_sk = (self.sinkhorn_div(logits_u_w, logits_u_s, self.temperature) * mask).mean()
 
-                    # For monitoring pseudo label distribution
-                    selected_pseudo_labels = pesudo_labels[mask.bool()]
-                    class_counts = torch.bincount(selected_pseudo_labels, minlength=self.num_classes).cpu().numpy()
-                    self.global_iteration += 1
-                    self.pseudo_label_iterations.append(self.global_iteration)
-                    self.pseudo_label_counts.append(class_counts)
-                
-                
-                loss_u = (self.focal_loss(logits_u_s, pesudo_labels) * mask).mean()
-                #loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
-                loss = loss_x + self.lambda_u * loss_u
+                loss = loss_x + self.lambda_u * loss_u + self.lambda_sk * loss_sk
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -146,6 +136,7 @@ class Trainer:
              
             total_loss_x += loss_x.item()
             total_loss_u += loss_u.item()
+            total_sinkhorn_loss += loss_sk.item()
             total_loss += loss.item()
             total_mask_ratio += mask.mean().item()
 
@@ -154,7 +145,7 @@ class Trainer:
             all_labels.extend(label.cpu().numpy())
 
             progress_bar.set_postfix(total_loss=f"{total_loss / step:.4f}", loss_x=f"{total_loss_x / step:.4f}", 
-                                     loss_u=f"{total_loss_u / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
+                                     loss_u=f"{total_loss_u / step:.4f}", loss_sk=f"{total_sinkhorn_loss / step:.4f}",  mask=f"{total_mask_ratio / step:.2f}")
         if self.scheduler is not None:
             self.scheduler.step()
 
@@ -163,30 +154,8 @@ class Trainer:
         metrics["supervised_loss"] = total_loss_x / num_steps
         metrics["unsupervised_loss"] = total_loss_u / num_steps
         metrics["mask_ratio"] = total_mask_ratio / num_steps
+        metrics["sinkhorn_loss"] = total_sinkhorn_loss / num_steps
         return avg_loss, metrics
-
-    def plot_pseudo_label_distribution(self):
-
-        counts = np.asarray(self.pseudo_label_counts)  # [num_iterations, class_num]
-        iterations = np.asarray(self.pseudo_label_iterations)  # [num_iterations]
-
-        idx_to_class = {0: "Center", 1: "Donut", 2: "Edge-Loc", 3: "Edge-Ring", 4: "Loc", 5: "Random", 6: "Scratch", 7: "Near-Full", 8: "none"}
-
-        plt.figure(figsize=(10, 7))
-        for class_idx in range(counts.shape[1]):
-            plt.plot(iterations, counts[:, class_idx], label=idx_to_class[class_idx], linewidth=1.0)
-
-        plt.xlabel("iteration")
-        plt.ylabel("pseudo label number")
-        plt.legend(loc="best", frameon=True)
-        plt.tight_layout()
-
-        output_dir = os.path.dirname(self.pseudo_label_plot_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(self.pseudo_label_plot_path, dpi=200)
-        plt.close()
-        print(f"Saved pseudo label distribution plot: {self.pseudo_label_plot_path}")
 
     def evaluate(self, data_loader, loader_name="Evaluating..."):
         self.model.eval()
@@ -225,6 +194,7 @@ class Trainer:
         print(f"[Epoch {epoch + 1}] Train Loss: {train_loss:.4f}, "
               f"Loss_s: {train_metrics['supervised_loss']:.4f}, "
               f"Loss_u: {train_metrics['unsupervised_loss']:.4f}, "
+              f"Loss_sk: {train_metrics['sinkhorn_loss']:.4f}, "
               f"Mask: {train_metrics['mask_ratio']:.4f}, "
               f"Acc: {train_metrics['accuracy']:.4f}, "
               f"Prec: {train_metrics['precision']:.4f}, "
