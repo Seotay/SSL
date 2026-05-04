@@ -1,4 +1,5 @@
-## backbone unfreeze
+## backbone freeze
+## layer3, layer4 unfreeze
 ## fc.classifier unfreeze
 
 04/29/2026 23:46:20 - INFO - root -   train_labeled_dataset: 129708
