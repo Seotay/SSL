@@ -5,8 +5,8 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch import optim
 from dataset.dataset import get_wm811k
 from model.model import ResnetModel
-from utils.utils import set_seed, EarlyStopping
-from utils.trainer import Trainer
+from utils.utils import set_seed, EarlyStopping, FocalLoss
+from utils.trainer_adsh_v2 import Trainer
 
 
 
@@ -80,20 +80,20 @@ if __name__ == "__main__":
         drop_last=False
         )
     
-    model = ResnetModel(model_name="resnet34", num_classes=9, pretrained=True).to(device)
+    model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(device)
     
     # 1. ResNet backbone freeze
     for param in model.backbone.parameters():
-        param.requires_grad = False
+        param.requires_grad = True
 
     # # 2. ResNet backbone layer3 unfreeze
     # for param in model.backbone.layer3.parameters():
     #     param.requires_grad = True
 
-    # # 3. ResNet backbone layer4 unfreeze
-    for param in model.backbone.layer4.parameters():
-        param.requires_grad = True
-
+    # # # 3. ResNet backbone layer4 unfreeze
+    # for param in model.backbone.layer4.parameters():
+    #     param.requires_grad = True
+ 
     # 4. fc classifier layer unfreeze
     for param in model.backbone.fc.parameters():
         param.requires_grad = True
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     #optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
+    focal_loss = FocalLoss(reduction="none", alpha=1, gamma=1.5)
 
     trainer = Trainer(
         model=model, 
@@ -111,7 +111,8 @@ if __name__ == "__main__":
         val_loader=val_loader, test_loader=test_loader,
         epochs=epochs,
         optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping,
-        lambda_u=0.2, temperature=1.0, threshold=0.90,
+        lambda_u=0.2, temperature=1.0, threshold=0.90, momentum_coef=0.8, focal_loss=focal_loss,
+        # self.num_classes = 9, self.threshold_update_every = 5, self.rho = 0.2,
         use_amp=True, device=device)
 
     trainer.training()

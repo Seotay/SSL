@@ -98,7 +98,7 @@ if __name__ == "__main__":
     # 4. fc classifier layer unfreeze
     for param in model.backbone.fc.parameters():
         param.requires_grad = True
-
+    print(model)
     early_stopping = EarlyStopping(patience=30, verbose=True, delta=0.0, path="./checkpoints/best_model.pt")
     #optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)

@@ -10,10 +10,8 @@ import time
 class Trainer:
     def __init__(self, model, labeled_trainloader, unlabeled_trainloader,
         val_loader, test_loader, epochs, optimizer, 
-        early_stopping=None, scheduler=None, lambda_u=1.0,
-        temperature=1.0, threshold=0.95,
-        
-        focal_loss=None, 
+        early_stopping=None, scheduler=None, lambda_u=1.0, lambda_sk=1.0,
+        temperature=1.0, threshold=0.95, sinkhorn_loss_fn = None, focal_loss=None, 
         pseudo_label_plot_path="./figures/pseudo_label_number_by_iteration(focal_loss).png",        
         use_amp=True, device=None
         
@@ -31,6 +29,8 @@ class Trainer:
 
         # Hyperparameters for semi-supervised learning
         self.lambda_u = lambda_u
+        self.lambda_sk = lambda_sk
+        self.sinkhorn_loss_fn = sinkhorn_loss_fn
         self.temperature = temperature
         self.threshold = threshold
 
@@ -86,6 +86,19 @@ class Trainer:
         self._evaluate_and_log(self.test_loader, "Test")
         self.plot_pseudo_label_distribution()
 
+    def sinkhorn_div(self, logits_u_w, logits_u_s, temperature):
+        prob_u_w = torch.softmax(logits_u_w.detach() / temperature, dim=-1).float().contiguous() # [B*mu, num_classes]
+        prob_u_s = torch.softmax(logits_u_s / temperature, dim=-1).float().contiguous() # [B*mu, num_classes]
+
+        batch_size, num_classes = prob_u_w.shape
+
+        # Safer support for categorical classes
+        class_support = torch.eye(num_classes, device=prob_u_w.device, dtype=prob_u_w.dtype)
+        class_support = class_support.unsqueeze(0).expand(batch_size, num_classes, num_classes).contiguous() # [B*mu, num_classes, num_classes]
+
+        sinkhorn_loss = self.sinkhorn_loss_fn(prob_u_w, class_support, prob_u_s, class_support)
+        return sinkhorn_loss # [B*mu]
+
 
     def train_one_epoch(self, epoch=None):
         self.model.train()
@@ -93,7 +106,7 @@ class Trainer:
         unlabeled_iter = iter(self.unlabeled_trainloader)
         num_steps = min(len(self.labeled_trainloader), len(self.unlabeled_trainloader))
 
-        total_loss, total_loss_x, total_loss_u, total_mask_ratio = 0.0, 0.0, 0.0, 0.0
+        total_loss, total_loss_x, total_loss_u, total_loss_sk, total_mask_ratio = 0.0, 0.0, 0.0, 0.0, 0.0
         all_labels, all_preds = [], []
         
         desc = "Training" if epoch is None else f"Training {epoch + 1}/{self.epochs}"
@@ -133,8 +146,11 @@ class Trainer:
                 
                 
                 loss_u = (self.focal_loss(logits_u_s, pseudo_labels ) * mask).mean()
+                loss_sk = (self.sinkhorn_div(logits_u_w, logits_u_s, self.temperature) * mask).mean()
+
+
                 #loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
-                loss = loss_x + self.lambda_u * loss_u
+                loss = loss_x + self.lambda_u * loss_u + self.lambda_sk * loss_sk
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -146,6 +162,7 @@ class Trainer:
              
             total_loss_x += loss_x.item()
             total_loss_u += loss_u.item()
+            total_loss_sk += loss_sk.item()
             total_loss += loss.item()
             total_mask_ratio += mask.mean().item()
 
@@ -154,7 +171,7 @@ class Trainer:
             all_labels.extend(label.cpu().numpy())
 
             progress_bar.set_postfix(total_loss=f"{total_loss / step:.4f}", loss_x=f"{total_loss_x / step:.4f}", 
-                                     loss_u=f"{total_loss_u / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
+                                     loss_u=f"{total_loss_u / step:.4f}", loss_sk=f"{total_loss_sk / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
         if self.scheduler is not None:
             self.scheduler.step()
 
@@ -162,6 +179,7 @@ class Trainer:
         metrics = compute_metrics(all_labels, all_preds)
         metrics["supervised_loss"] = total_loss_x / num_steps
         metrics["unsupervised_loss"] = total_loss_u / num_steps
+        metrics["sinkhorn_loss"] = total_loss_sk / num_steps
         metrics["mask_ratio"] = total_mask_ratio / num_steps
         return avg_loss, metrics
 
@@ -225,6 +243,7 @@ class Trainer:
         print(f"[Epoch {epoch + 1}] Train Loss: {train_loss:.4f}, "
               f"Loss_s: {train_metrics['supervised_loss']:.4f}, "
               f"Loss_u: {train_metrics['unsupervised_loss']:.4f}, "
+              f"Loss_sk: {train_metrics['sinkhorn_loss']:.4f}, "  
               f"Mask: {train_metrics['mask_ratio']:.4f}, "
               f"Acc: {train_metrics['accuracy']:.4f}, "
               f"Prec: {train_metrics['precision']:.4f}, "

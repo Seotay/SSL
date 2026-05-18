@@ -6,7 +6,7 @@ from torch import optim
 from dataset.dataset import get_wm811k
 from model.model import ResnetModel
 from utils.utils import set_seed, EarlyStopping
-from utils.trainer import Trainer
+from utils.trainer_adsh import Trainer
 
 
 
@@ -80,20 +80,20 @@ if __name__ == "__main__":
         drop_last=False
         )
     
-    model = ResnetModel(model_name="resnet34", num_classes=9, pretrained=True).to(device)
+    model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(device)
     
     # 1. ResNet backbone freeze
     for param in model.backbone.parameters():
-        param.requires_grad = False
+        param.requires_grad = True
 
     # # 2. ResNet backbone layer3 unfreeze
     # for param in model.backbone.layer3.parameters():
     #     param.requires_grad = True
 
-    # # 3. ResNet backbone layer4 unfreeze
-    for param in model.backbone.layer4.parameters():
-        param.requires_grad = True
-
+    # # # 3. ResNet backbone layer4 unfreeze
+    # for param in model.backbone.layer4.parameters():
+    #     param.requires_grad = True
+ 
     # 4. fc classifier layer unfreeze
     for param in model.backbone.fc.parameters():
         param.requires_grad = True
@@ -112,6 +112,7 @@ if __name__ == "__main__":
         epochs=epochs,
         optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping,
         lambda_u=0.2, temperature=1.0, threshold=0.90,
+        # self.num_classes = 9, self.threshold_update_every = 5, self.rho = 0.2,
         use_amp=True, device=device)
 
     trainer.training()

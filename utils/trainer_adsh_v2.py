@@ -1,8 +1,5 @@
 import torch
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import os
 from utils.utils import format_time, compute_metrics
 from tqdm import tqdm
 import time
@@ -10,13 +7,9 @@ import time
 class Trainer:
     def __init__(self, model, labeled_trainloader, unlabeled_trainloader,
         val_loader, test_loader, epochs, optimizer, 
-        early_stopping=None, scheduler=None, lambda_u=1.0,
-        temperature=1.0, threshold=0.95,
-        
-        focal_loss=None, 
-        pseudo_label_plot_path="./figures/pseudo_label_number_by_iteration(focal_loss).png",        
-        use_amp=True, device=None
-        
+        early_stopping=None, device=None, scheduler=None, lambda_u=1.0,
+        temperature=1.0, threshold=0.95, momentum_coef=0.8, focal_loss=None,
+        use_amp=True,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -33,17 +26,17 @@ class Trainer:
         self.lambda_u = lambda_u
         self.temperature = temperature
         self.threshold = threshold
-
+        self.momentum_coef = momentum_coef
         self.focal_loss = focal_loss
-        self.pseudo_label_plot_path = pseudo_label_plot_path
 
-        self.use_amp = use_amp
+        # adsh
+        self.num_classes = 9
+        self.majority_class = 8
+        self.threshold_update_every = 3
+        self.class_thresholds = torch.full((self.num_classes, ), self.threshold, device=self.device)
+
+        self.use_amp = use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
-        
-        self.pseudo_label_iterations = []
-        self.pseudo_label_counts = []
-        self.global_iteration = 0
-        self.num_classes = None
 
     @staticmethod
     def _next_batch(iterator, loader):
@@ -61,9 +54,13 @@ class Trainer:
         assert self.val_loader is not None, "val_loader must be provided."
 
         for epoch in range(self.epochs):
+            if (epoch + 1) % self.threshold_update_every == 0:
+                self.update_thresholds(epoch)
             train_loss, train_metrics = self.train_one_epoch(epoch)
             val_loss, val_metrics = self.evaluate(data_loader=self.val_loader, loader_name="Validation Evaluating...")
             self._print_epoch_summary(epoch, train_loss, train_metrics, val_loss, val_metrics)
+            
+
 
             # Early stopping check
             self.early_stopping(val_metrics["f1"], self.model)
@@ -84,9 +81,66 @@ class Trainer:
         self._evaluate_and_log(self.labeled_trainloader, "Best Model Train")
         self._evaluate_and_log(self.val_loader, "Best Model Validation")
         self._evaluate_and_log(self.test_loader, "Test")
-        self.plot_pseudo_label_distribution()
 
+    
+    @torch.no_grad()
+    def update_thresholds(self, epoch):
+        self.model.eval()
 
+        C = [[] for _ in range(self.num_classes)]
+        for unlabeled_batch in tqdm(self.unlabeled_trainloader, desc="Updating Thresholds", leave=False):
+            (inputs_u_w, _), _ = unlabeled_batch
+            inputs_u_w = inputs_u_w.to(self.device)
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                logits_u_w = self.model(inputs_u_w)
+                prob_u_w = torch.softmax(logits_u_w.detach() / self.temperature, dim=-1)
+
+            max_probs, pseudo_labels = torch.max(prob_u_w, dim=-1)
+            max_probs = max_probs.cpu()
+            pseudo_labels = pseudo_labels.cpu()
+
+            for conf, cls in zip(max_probs, pseudo_labels):
+                C[int(cls.item())].append(float(conf.item()))
+
+        # majority class=8
+        C_majority = sorted(C[self.majority_class], reverse=True)
+        if len(C_majority) == 0:
+            print("No pseudo-labels for majority class. Skipping threshold update.")
+            self.class_thresholds = torch.full((self.num_classes,), self.threshold, device=self.device)
+            return
+        
+        rho = sum(conf >= self.threshold for conf in C_majority) / len(C_majority)
+
+        tau_k_list  = []
+        for k in range(self.num_classes):
+            Ck = sorted(C[k], reverse=True)
+
+            if len(Ck) == 0:
+                tau_k = self.threshold
+            
+            elif rho <=0:
+                tau_k = 1.0
+            
+            elif k == self.majority_class:
+                tau_k = self.threshold
+            
+            else:
+                idx = int(torch.ceil(torch.tensor(rho * len(Ck))).item()) - 1
+                idx = max(0, min(idx, len(Ck) - 1))
+                tau_k = Ck[idx]
+
+            tau_k_list.append(tau_k)        
+    
+        current_thresholds = torch.as_tensor(tau_k_list, dtype=torch.float32, device=self.device).clamp(1e-12, 1.0)
+
+        self.class_thresholds = ((1.0 - self.momentum_coef) * current_thresholds + self.momentum_coef * self.class_thresholds).clamp(1e-12, 1.0)
+        self.class_thresholds[self.majority_class] = self.threshold
+
+        print(f"[Epoch {epoch + 1}] rho: {rho:.2f}, "
+              f"Current Thresholds: {current_thresholds.detach().cpu().numpy().round(2)}, "
+              f"EMA Thresholds: {self.class_thresholds.detach().cpu().numpy().round(2)}")
+        
     def train_one_epoch(self, epoch=None):
         self.model.train()
         labeled_iter = iter(self.labeled_trainloader)
@@ -113,27 +167,15 @@ class Trainer:
             with torch.amp.autocast("cuda", enabled=self.use_amp):
                 logits_labeled_x, logits_u_s = self.model(labeled_x), self.model(inputs_u_s)
                 loss_x = F.cross_entropy(logits_labeled_x, label)
-                #loss_x = self.focal_loss(logits_labeled_x, label).mean()
                 
                 with torch.no_grad():
                     logits_u_w = self.model(inputs_u_w) # [B*mu, num_classes]
                     prob_u_w = torch.softmax(logits_u_w.detach() / self.temperature, dim=-1) # [B*mu, num_classes]
-                    max_probs, pseudo_labels  = torch.max(prob_u_w, dim=-1) # max_probs: [B*mu, 1], pesudo_labels: [B*mu, 1]
-                    mask = max_probs.ge(self.threshold).float() # [B*mu, 1]: True / False
-
-                    if self.num_classes is None:
-                        self.num_classes = logits_u_w.size(-1)
-
-                    # For monitoring pseudo label distribution
-                    selected_pseudo_labels = pseudo_labels [mask.bool()]
-                    class_counts = torch.bincount(selected_pseudo_labels, minlength=self.num_classes).cpu().numpy()
-                    self.global_iteration += 1
-                    self.pseudo_label_iterations.append(self.global_iteration)
-                    self.pseudo_label_counts.append(class_counts)
+                    max_probs, pseudo_labels = torch.max(prob_u_w, dim=-1) # max_probs: [B*mu, 1], pseudo_labels: [B*mu, 1]
+                    tau_k = self.class_thresholds[pseudo_labels]
+                    mask = max_probs.ge(tau_k).float() # [B*mu, 1]: True / False
                 
-                
-                loss_u = (self.focal_loss(logits_u_s, pseudo_labels ) * mask).mean()
-                #loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
+                loss_u = (self.focal_loss(logits_u_s, pseudo_labels) * mask).mean()
                 loss = loss_x + self.lambda_u * loss_u
 
             if self.use_amp:
@@ -165,29 +207,6 @@ class Trainer:
         metrics["mask_ratio"] = total_mask_ratio / num_steps
         return avg_loss, metrics
 
-    def plot_pseudo_label_distribution(self):
-
-        counts = np.asarray(self.pseudo_label_counts)  # [num_iterations, class_num]
-        iterations = np.asarray(self.pseudo_label_iterations)  # [num_iterations]
-
-        idx_to_class = {0: "Center", 1: "Donut", 2: "Edge-Loc", 3: "Edge-Ring", 4: "Loc", 5: "Random", 6: "Scratch", 7: "Near-Full", 8: "none"}
-
-        plt.figure(figsize=(10, 7))
-        for class_idx in range(counts.shape[1]):
-            plt.plot(iterations, counts[:, class_idx], label=idx_to_class[class_idx], linewidth=1.0)
-
-        plt.xlabel("iteration")
-        plt.ylabel("pseudo label number")
-        plt.legend(loc="best", frameon=True)
-        plt.tight_layout()
-
-        output_dir = os.path.dirname(self.pseudo_label_plot_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(self.pseudo_label_plot_path, dpi=200)
-        plt.close()
-        print(f"Saved pseudo label distribution plot: {self.pseudo_label_plot_path}")
-
     def evaluate(self, data_loader, loader_name="Evaluating..."):
         self.model.eval()
         total_loss = 0.0
@@ -213,7 +232,6 @@ class Trainer:
         return avg_loss, metrics
 
 
-
     def _evaluate_and_log(self, data_loader, title):
         loss, metrics = self.evaluate(data_loader=data_loader, loader_name=f"{title} Evaluating...")
         print(f"[{title}] Loss: {loss:.4f}, " f"Acc: {metrics['accuracy']:.4f}, " f"Prec: {metrics['precision']:.4f}, " f"Rec: {metrics['recall']:.4f}, " f"F1: {metrics['f1']:.4f}")
@@ -236,3 +254,5 @@ class Trainer:
               f"Prec: {val_metrics['precision']:.4f}, "
               f"Rec: {val_metrics['recall']:.4f}, "
               f"F1: {val_metrics['f1']:.4f}")
+        
+

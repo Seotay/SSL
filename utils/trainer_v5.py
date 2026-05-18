@@ -10,7 +10,7 @@ import time
 class Trainer:
     def __init__(self, model, labeled_trainloader, unlabeled_trainloader,
         val_loader, test_loader, epochs, optimizer, 
-        early_stopping=None, scheduler=None, lambda_u=1.0,
+        early_stopping=None, scheduler=None, lambda_u=1.0, lambda_kl=1.0,
         temperature=1.0, threshold=0.95,
         
         focal_loss=None, 
@@ -31,6 +31,7 @@ class Trainer:
 
         # Hyperparameters for semi-supervised learning
         self.lambda_u = lambda_u
+        self.lambda_kl = lambda_kl
         self.temperature = temperature
         self.threshold = threshold
 
@@ -86,6 +87,13 @@ class Trainer:
         self._evaluate_and_log(self.test_loader, "Test")
         self.plot_pseudo_label_distribution()
 
+    @staticmethod
+    def kl_div(logits_u_w, logits_u_s, temperature, reduction='none'):
+        prob_u_w = torch.softmax(logits_u_w.detach() / temperature, dim=-1)
+        log_prob_u_s = F.log_softmax(logits_u_s / temperature, dim=-1)
+        kl_loss = F.kl_div(log_prob_u_s, prob_u_w, reduction=reduction).sum(dim=1) # [B*mu, classes] -> [B*mu]
+        return kl_loss
+
 
     def train_one_epoch(self, epoch=None):
         self.model.train()
@@ -93,7 +101,7 @@ class Trainer:
         unlabeled_iter = iter(self.unlabeled_trainloader)
         num_steps = min(len(self.labeled_trainloader), len(self.unlabeled_trainloader))
 
-        total_loss, total_loss_x, total_loss_u, total_mask_ratio = 0.0, 0.0, 0.0, 0.0
+        total_loss, total_loss_x, total_loss_u, total_loss_kl, total_mask_ratio = 0.0, 0.0, 0.0, 0.0, 0.0
         all_labels, all_preds = [], []
         
         desc = "Training" if epoch is None else f"Training {epoch + 1}/{self.epochs}"
@@ -133,8 +141,11 @@ class Trainer:
                 
                 
                 loss_u = (self.focal_loss(logits_u_s, pseudo_labels ) * mask).mean()
+                loss_kl = (self.kl_div(logits_u_w, logits_u_s, self.temperature, reduction="none") * mask).mean()
+
+
                 #loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
-                loss = loss_x + self.lambda_u * loss_u
+                loss = loss_x + self.lambda_u * loss_u + self.lambda_kl * loss_kl
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -146,6 +157,7 @@ class Trainer:
              
             total_loss_x += loss_x.item()
             total_loss_u += loss_u.item()
+            total_loss_kl += loss_kl.item()
             total_loss += loss.item()
             total_mask_ratio += mask.mean().item()
 
@@ -154,7 +166,7 @@ class Trainer:
             all_labels.extend(label.cpu().numpy())
 
             progress_bar.set_postfix(total_loss=f"{total_loss / step:.4f}", loss_x=f"{total_loss_x / step:.4f}", 
-                                     loss_u=f"{total_loss_u / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
+                                     loss_u=f"{total_loss_u / step:.4f}", loss_kl=f"{total_loss_kl / step:.4f}", mask=f"{total_mask_ratio / step:.2f}")
         if self.scheduler is not None:
             self.scheduler.step()
 
@@ -162,6 +174,7 @@ class Trainer:
         metrics = compute_metrics(all_labels, all_preds)
         metrics["supervised_loss"] = total_loss_x / num_steps
         metrics["unsupervised_loss"] = total_loss_u / num_steps
+        metrics["kl_loss"] = total_loss_kl / num_steps
         metrics["mask_ratio"] = total_mask_ratio / num_steps
         return avg_loss, metrics
 
@@ -225,6 +238,7 @@ class Trainer:
         print(f"[Epoch {epoch + 1}] Train Loss: {train_loss:.4f}, "
               f"Loss_s: {train_metrics['supervised_loss']:.4f}, "
               f"Loss_u: {train_metrics['unsupervised_loss']:.4f}, "
+              f"Loss_kl: {train_metrics['kl_loss']:.4f}, "  
               f"Mask: {train_metrics['mask_ratio']:.4f}, "
               f"Acc: {train_metrics['accuracy']:.4f}, "
               f"Prec: {train_metrics['precision']:.4f}, "

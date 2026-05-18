@@ -4,7 +4,7 @@ from torchvision.models import (resnet18, resnet34, resnet50, resnet101,
 
 
 class ResnetModel(nn.Module):
-    def __init__(self, model_name="resnet18", num_classes=10, pretrained=True):
+    def __init__(self, model_name="resnet18", num_classes=9, pretrained=True):
         super(ResnetModel, self).__init__()
 
         if model_name == "resnet18":
