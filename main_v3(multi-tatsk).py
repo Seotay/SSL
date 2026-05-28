@@ -1,11 +1,10 @@
 import torch
 import logging
-
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch import optim
 from dataset.dataset import get_wm811k
 from model.model import ResnetModel
-from utils.utils import set_seed, EarlyStopping
+from utils.utils import set_seed, EarlyStopping, FocalLoss, MultiTaskLossWeighting
 from utils.trainer_v3 import Trainer
 
 
@@ -32,7 +31,7 @@ if __name__ == "__main__":
         val_ratio=0.15,
         test_ratio=0.10,
         image_size= 96,
-        data_seed=0,
+        data_seed=1,
         label_ratio=label_ratio,
 
         cutout_num_holes=4,
@@ -80,11 +79,11 @@ if __name__ == "__main__":
         drop_last=False
         )
     
-    model = ResnetModel(model_name="resnet50", num_classes=9, pretrained=True).to(device)
+    model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(device)
     
     # 1. ResNet backbone freeze
     for param in model.backbone.parameters():
-        param.requires_grad = False
+        param.requires_grad = True
 
     # # 2. ResNet backbone layer3 unfreeze
     # for param in model.backbone.layer3.parameters():
@@ -99,19 +98,21 @@ if __name__ == "__main__":
         param.requires_grad = True
 
     early_stopping = EarlyStopping(patience=30, verbose=True, delta=0.0, path="./checkpoints/best_model.pt")
-    #optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
+    mtl_weighting = MultiTaskLossWeighting(num=2).to(device)
+    optimizer = optim.Adam([{"params": filter(lambda p: p.requires_grad, model.parameters()), "lr": 1e-3, "weight_decay": 1e-5},
+                            {"params": mtl_weighting.parameters(), "lr": 1e-4, "weight_decay": 0.0}
+                            ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
 
 
     trainer = Trainer(
         model=model, 
         labeled_trainloader=labeled_trainloader, unlabeled_trainloader=unlabeled_trainloader,
         val_loader=val_loader, test_loader=test_loader,
-        epochs=epochs,
-        optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping,
-        
-        lambda_u=0.2, lambda_kl=0.2, temperature=1.0, threshold=0.90,
+        epochs=epochs, optimizer=optimizer, scheduler=scheduler, early_stopping=early_stopping, 
+        temperature=1.0, threshold=0.90,
+        mtl_weighting=mtl_weighting,
         use_amp=True, device=device)
 
     trainer.training()

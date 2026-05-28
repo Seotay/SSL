@@ -27,10 +27,9 @@ class ResnetModel(nn.Module):
 
         # Change the classification head to have num_classes output neurons
         in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Sequential(
-            nn.Linear(in_features=in_features, out_features=num_classes, bias=True)
-                                         )
+        self.backbone.fc = nn.Sequential(nn.Linear(in_features=in_features, out_features=num_classes, bias=True))
 
     def forward(self, x):
         x = self.backbone(x)
         return x
+    

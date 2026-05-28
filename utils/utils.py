@@ -1,3 +1,4 @@
+import math
 import random
 import numpy as np
 import torch
@@ -14,6 +15,34 @@ def format_time(seconds):
     minutes = int(seconds // 60)
     seconds = seconds % 60
     return f"{minutes} min {seconds:.2f} sec"    
+
+
+def exploit_and_explore(top_checkpoint_path, bot_checkpoint_path,
+                        perturb_factors=(1.2, 0.80), threshold_steps=(-0.015, 0.015),
+                        lambda_bounds=(0.1, 3.0), threshold_bounds=(0.90, 0.98),
+):
+    """Copy a strong population member and perturb lambda_u and threshold."""
+
+    checkpoint = torch.load(top_checkpoint_path, map_location="cpu", weights_only=True)
+    lambda_u = checkpoint.get("lambda_u")
+    threshold = checkpoint.get("threshold")
+
+    if lambda_u is not None:
+        perturb = np.random.choice(perturb_factors)
+        lambda_u = float(lambda_u * perturb)
+        lambda_u = float(np.clip(lambda_u, lambda_bounds[0], lambda_bounds[1]))
+
+    if threshold is not None:
+        threshold_step = np.random.choice(threshold_steps)
+        threshold = float(threshold + threshold_step)
+        threshold = float(np.clip(threshold, threshold_bounds[0], threshold_bounds[1]))
+
+    checkpoint["lambda_u"] = lambda_u
+    checkpoint["threshold"] = threshold
+    torch.save(checkpoint, bot_checkpoint_path)
+    return lambda_u, threshold
+
+
 
 class EarlyStopping:
     def __init__(self, patience=5, verbose=False, delta=0, path="./checkpoint/best_model.pt"):
@@ -45,7 +74,7 @@ class EarlyStopping:
 
     def save_checkpoint(self, model):
         if self.verbose and self.best_val_f1 is not None:
-            print(f"\tValidation F1 improved → Saving model: {self.path}")
+            print(f"\tValidation F1 improved Saving model: {self.path}")
         torch.save(model.state_dict(), self.path)
 
     def load_best_model(self, model, device=None):
@@ -63,6 +92,7 @@ def compute_metrics(y_true, y_pred):
 
     return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1,
                 "classification_report": report, "confusion_matrix": conf_matrix}
+
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2, reduction='mean'):
@@ -98,3 +128,27 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         else:
             return focal_loss
+
+
+class MultiTaskLossWeighting(nn.Module):
+    """AWL-style multi-task loss weighting with trainer_v3 compatibility."""
+
+    def __init__(self, num=2):
+        super().__init__()
+        params = torch.ones(num, dtype=torch.float32)
+        self.params = nn.Parameter(params)
+    
+    def mtl_term(self, loss, param):
+        weight = 0.5 / (param ** 2)
+        weighted_loss = weight * loss + torch.log(1 + param ** 2)
+        return weighted_loss, weight
+
+    def forward(self, loss_s, loss_u):
+        loss_s_weighted, alpha = self.mtl_term(loss_s, self.params[0])
+        loss_u_weighted, beta = self.mtl_term(loss_u, self.params[1])
+        total_loss = loss_s_weighted + loss_u_weighted
+    
+        return total_loss, alpha.detach(), beta.detach()
+    
+
+

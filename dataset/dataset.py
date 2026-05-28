@@ -5,7 +5,7 @@ from torchvision.transforms import InterpolationMode
 from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
-
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 def load_wm811k_pickles(labeled_path, unlabeled_path):
     labeled_df = pd.read_pickle(labeled_path)
@@ -158,19 +158,10 @@ class WM811KSSL(Dataset):
         return img, target
 
 
-def get_wm811k(
-    labeled_path,
-    unlabeled_path,
-    train_ratio=0.75,
-    val_ratio=0.15,
-    test_ratio=0.1,
-    label_ratio=0.5,
-    image_size=128,
-    data_seed=42,
-    cutout_num_holes=4,
-    cutout_ratio=0.2,
-    noise_prob=0.05,
-):
+def get_wm811k(labeled_path, unlabeled_path, 
+               train_ratio=0.75,val_ratio=0.15, test_ratio=0.1, label_ratio=0.5,image_size=128, 
+               cutout_num_holes=4, cutout_ratio=0.2, noise_prob=0.05,
+               data_seed=42):
 
     transform_labeled = transforms.Compose([
         transforms.Resize((image_size, image_size), interpolation=InterpolationMode.NEAREST),
@@ -225,6 +216,26 @@ def get_wm811k(
     )
 
     return train_labeled_dataset, train_unlabeled_dataset, val_dataset, test_dataset
+
+
+def get_wm811k_loaders(train_labeled_dataset, train_unlabeled_dataset, val_dataset, test_dataset, batch_size, mu):
+    labeled_trainloader = DataLoader(train_labeled_dataset, 
+                                     sampler=RandomSampler(train_labeled_dataset),
+                                     batch_size=batch_size,
+                                     num_workers=2,
+                                     pin_memory=True,
+                                     persistent_workers=True,
+                                     drop_last=False)
+    unlabeled_trainloader = DataLoader(train_unlabeled_dataset, 
+                                       sampler=RandomSampler(train_unlabeled_dataset),
+                                       batch_size=batch_size * mu,
+                                       num_workers=2,
+                                       pin_memory=True,
+                                       persistent_workers=True,
+                                       drop_last=False)
+    val_loader = DataLoader(val_dataset, sampler=SequentialSampler(val_dataset), batch_size=batch_size, drop_last=False)
+    test_loader = DataLoader(test_dataset, sampler=SequentialSampler(test_dataset), batch_size=batch_size, drop_last=False)
+    return labeled_trainloader, unlabeled_trainloader, val_loader, test_loader
 
 
 def print_dataset_distribution(name, dataset):
