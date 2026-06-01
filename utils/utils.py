@@ -16,31 +16,27 @@ def format_time(seconds):
     seconds = seconds % 60
     return f"{minutes} min {seconds:.2f} sec"    
 
-
 def exploit_and_explore(top_checkpoint_path, bot_checkpoint_path,
-                        perturb_factors=(1.2, 0.80), threshold_steps=(-0.015, 0.015),
-                        lambda_bounds=(0.1, 3.0), threshold_bounds=(0.90, 0.98),
-):
-    """Copy a strong population member and perturb lambda_u and threshold."""
-
+                              perturb_factors=(0.90, 1.10), gamma_bounds=(0.0, 5.0),
+                              threshold_steps=(-0.015, 0.015), threshold_bounds=(0.90, 0.98)):
     checkpoint = torch.load(top_checkpoint_path, map_location="cpu", weights_only=True)
-    lambda_u = checkpoint.get("lambda_u")
+    gamma = checkpoint.get("gamma")
     threshold = checkpoint.get("threshold")
 
-    if lambda_u is not None:
+    if gamma is not None:
         perturb = np.random.choice(perturb_factors)
-        lambda_u = float(lambda_u * perturb)
-        lambda_u = float(np.clip(lambda_u, lambda_bounds[0], lambda_bounds[1]))
-
+        gamma = float(gamma * perturb)
+        gamma = float(np.clip(gamma, gamma_bounds[0], gamma_bounds[1]))
+    
     if threshold is not None:
         threshold_step = np.random.choice(threshold_steps)
         threshold = float(threshold + threshold_step)
         threshold = float(np.clip(threshold, threshold_bounds[0], threshold_bounds[1]))
 
-    checkpoint["lambda_u"] = lambda_u
+    checkpoint["gamma"] = gamma
     checkpoint["threshold"] = threshold
     torch.save(checkpoint, bot_checkpoint_path)
-    return lambda_u, threshold
+    return gamma, threshold
 
 
 
