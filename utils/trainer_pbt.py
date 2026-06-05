@@ -192,6 +192,7 @@ class PBT(Trainer):
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optim_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
             "lambda_u": float(self.lambda_u),
             "threshold": float(self.threshold),
             "model_name": getattr(self.model, "model_name", None),
@@ -202,9 +203,11 @@ class PBT(Trainer):
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)        
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optim_state_dict"])
-        self.lambda_u = float(ckpt["lambda_u"])
-        self.threshold = float(ckpt["threshold"])
-    
+        if self.scheduler is not None and ckpt["scheduler_state_dict"] is not None:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        self.lambda_u = float(ckpt.get("lambda_u", self.lambda_u))
+        self.threshold = float(ckpt.get("threshold", self.threshold))
+
     def set_id(self, task_id):
         self.task_id = task_id
 

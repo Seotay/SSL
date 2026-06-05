@@ -1,4 +1,3 @@
-import math
 import random
 import numpy as np
 import torch
@@ -16,27 +15,7 @@ def format_time(seconds):
     seconds = seconds % 60
     return f"{minutes} min {seconds:.2f} sec"    
 
-def exploit_and_explore(top_checkpoint_path, bot_checkpoint_path,
-                              perturb_factors=(0.90, 1.10), gamma_bounds=(0.0, 5.0),
-                              threshold_steps=(-0.015, 0.015), threshold_bounds=(0.90, 0.98)):
-    checkpoint = torch.load(top_checkpoint_path, map_location="cpu", weights_only=True)
-    gamma = checkpoint.get("gamma")
-    threshold = checkpoint.get("threshold")
 
-    if gamma is not None:
-        perturb = np.random.choice(perturb_factors)
-        gamma = float(gamma * perturb)
-        gamma = float(np.clip(gamma, gamma_bounds[0], gamma_bounds[1]))
-    
-    if threshold is not None:
-        threshold_step = np.random.choice(threshold_steps)
-        threshold = float(threshold + threshold_step)
-        threshold = float(np.clip(threshold, threshold_bounds[0], threshold_bounds[1]))
-
-    checkpoint["gamma"] = gamma
-    checkpoint["threshold"] = threshold
-    torch.save(checkpoint, bot_checkpoint_path)
-    return gamma, threshold
 
 
 

@@ -12,9 +12,11 @@ from dataset.dataset import get_wm811k, get_wm811k_loaders
 from model.model import ResnetModel
 from utils import trainer
 from utils.trainer_pbt import PBT
-from utils.utils import exploit_and_explore, format_time, set_seed
+from utils.utils import format_time, set_seed
 from torch.utils.data import DataLoader, SequentialSampler
 
+BASE_SEED = 42
+DATA_SEED = 0
 CHECKPOINT_DIR = "./checkpoints"
 POPULATION_SIZE = 3
 NUM_WORKERS = 3
@@ -22,10 +24,10 @@ BATCH_SIZE = 256
 MU = 4
 MAX_PBT_ROUNDS = 30 #30
 PBT_INTERVAL = 5 #5
-LABEL_RATIO = 1.0
+LABEL_RATIO = 1.00
 INIT_HYPERPARAMETERS = {
-    "lambda_u": (0.2, 1.5, 3.0),
-    "threshold": (0.90, 0.925, 0.95),
+    "lambda_u": (0.01, 1, 100),
+    "threshold": (0.85, 0.90, 0.95),
 }
 EXPLOIT_FRACTION = 0.2
 
@@ -37,7 +39,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-
+# Global function
 def population_checkpoint_path(checkpoints_dir, task_id):
     return os.path.join(checkpoints_dir, f"task-{task_id:02d}_population.pth")
 
@@ -57,7 +59,7 @@ def reset_task_checkpoints(checkpoints_dir):
         if os.path.isfile(ckpt_file):
             os.remove(ckpt_file)
 
-
+# Global function
 def initialize_population(population_q, population_size, init_hyperparameter, checkpoints_dir):
     assert population_size == len(init_hyperparameter["lambda_u"]), \
         "population_size must match the number of lambda candidates."
@@ -75,20 +77,47 @@ def initialize_population(population_q, population_size, init_hyperparameter, ch
 
         model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(torch.device("cpu"))
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
-
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, MAX_PBT_ROUNDS * PBT_INTERVAL))
         torch.save({"model_state_dict": model.state_dict(),
                     "optim_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "lambda_u": float(lambda_u), 
                     "threshold": float(threshold)}, population_checkpoint_path(checkpoints_dir, task_id))
-        logs.append(f"task {task_id}: lambda={float(lambda_u):.3f}, threshold={float(threshold):.3f}")
+        logs.append(f"task {task_id}: λ={float(lambda_u):.3f}, τ={float(threshold):.3f}")
 
     print("[PBT Initial] " + " | ".join(logs))
     return init_hyperparameter["lambda_u"], init_hyperparameter["threshold"]
 
+# Global function
+def exploit_and_explore(top_checkpoint_path, bot_checkpoint_path,
+                              perturb_factors=(0.60, 1.4), lambda_bounds=(0.0001, 1000),
+                              threshold_steps=(-0.015, 0.015), threshold_bounds=(0.83, 0.98)):
+    checkpoint = torch.load(top_checkpoint_path, map_location="cpu", weights_only=True)
+    # Prefer current key `lambda_u`; keep `gamma` as backward-compatible fallback.
+    lambda_u = checkpoint.get("lambda_u", checkpoint.get("gamma"))
+    threshold = checkpoint.get("threshold")
 
+    if lambda_u is not None:
+        perturb = np.random.choice(perturb_factors)
+        lambda_u = float(lambda_u * perturb)
+        lambda_u = float(np.clip(lambda_u, lambda_bounds[0], lambda_bounds[1]))
+    
+    if threshold is not None:
+        threshold_step = np.random.choice(threshold_steps)
+        threshold = float(threshold + threshold_step)
+        threshold = float(np.clip(threshold, threshold_bounds[0], threshold_bounds[1]))
+
+    checkpoint["lambda_u"] = lambda_u
+    # Preserve legacy field for older training code paths that may still read `gamma`.
+    checkpoint["gamma"] = lambda_u
+    checkpoint["threshold"] = threshold
+    torch.save(checkpoint, bot_checkpoint_path)
+    return lambda_u, threshold
+
+# worker class
 class Worker(mp.Process):
     def __init__(self, train_labeled_dataset, train_unlabeled_dataset, 
-                 val_dataset, test_dataset, batch_size, mu,
+                 val_dataset, test_dataset, batch_size, mu, base_seed,
                  pbt_interval, round_counter, max_pbt_rounds, population_q, 
                  finish_tasks_q, checkpoints_dir, best_score, best_lock, device):
         super().__init__()
@@ -102,6 +131,7 @@ class Worker(mp.Process):
         # loader * model
         self.batch_size = batch_size
         self.mu = mu
+        self.base_seed = base_seed
         self.device = device
 
         # pbt
@@ -130,6 +160,7 @@ class Worker(mp.Process):
             use_amp=True, device=self.device)
 
     def run(self):
+        set_seed(self.base_seed)
         trainer = self.build_trainer()
 
         while self.round_counter.value < self.max_pbt_rounds:
@@ -198,9 +229,9 @@ class Worker(mp.Process):
         return task_dict.get(key, 0.0)
 
 
-
+# explore class
 class Explorer(mp.Process):
-    def __init__(self, round_counter, max_pbt_rounds, population_q, finish_tasks_q, checkpoints_dir, exploit_fraction):
+    def __init__(self, round_counter, max_pbt_rounds, population_q, finish_tasks_q, checkpoints_dir, exploit_fraction, base_seed):
         super().__init__()
         self.round_counter = round_counter
         self.max_pbt_rounds = max_pbt_rounds
@@ -208,8 +239,10 @@ class Explorer(mp.Process):
         self.finish_tasks_q = finish_tasks_q
         self.checkpoints_dir = checkpoints_dir
         self.exploit_fraction = exploit_fraction
+        self.base_seed = base_seed
 
     def run(self):  
+        set_seed(self.base_seed)
         while self.round_counter.value < self.max_pbt_rounds:
             if not (self.population_q.empty() and self.finish_tasks_q.full()):
                 time.sleep(1)
@@ -223,6 +256,8 @@ class Explorer(mp.Process):
             cutoff = max(1, int(np.ceil(self.exploit_fraction * len(tasks))))
             tops = tasks[:cutoff]
             bottoms = tasks[-cutoff:]
+            best_before = dict(tasks[0])
+            worst_before = dict(tasks[-1])
 
             round_idx = self.round_counter.value + 1
             updates_log = []
@@ -232,19 +267,34 @@ class Explorer(mp.Process):
                     population_checkpoint_path(self.checkpoints_dir, top["id"]),
                     population_checkpoint_path(self.checkpoints_dir, bottom["id"]),
                 )
+
+                if updated_lambda is None:
+                    updated_lambda = top.get("lambda_u", bottom.get("lambda_u", 0.2))
+                if updated_threshold is None:
+                    updated_threshold = top.get("threshold", bottom.get("threshold", 0.90))
+
                 bottom["lambda_u"] = float(updated_lambda)
                 bottom["threshold"] = float(updated_threshold)
                 bottom.setdefault("lambda_history", []).append(float(updated_lambda))
                 bottom.setdefault("threshold_history", []).append(float(updated_threshold))
-                updates_log.append(f"{bottom['id']}<-{top['id']}(lambda={float(updated_lambda):.4f}, threshold={float(updated_threshold):.4f})")
+                updates_log.append(f"{bottom['id']} <- {top['id']}(λ={float(updated_lambda):.4f}, τ={float(updated_threshold):.4f})")
 
             current_epoch = round_idx * PBT_INTERVAL
             total_epoch = self.max_pbt_rounds * PBT_INTERVAL
-            print(f"[PBT Round {round_idx}/{self.max_pbt_rounds}, epoch {current_epoch}/{total_epoch}] "
-                  f"best={tasks[0]['id']} | (lambda={tasks[0].get('lambda_u', 0.0):.4f}, threshold={tasks[0].get('threshold', 0.0):.4f}) "
-                  f"f1-score={tasks[0]['f1_score']:.4f} | "
-                  f"worst={tasks[-1]['id']} | f1-score={tasks[-1]['f1_score']:.4f} | "
-                  f"update={', '.join(updates_log)}")
+
+            
+            print(f"\n[PBT Round {round_idx}/{self.max_pbt_rounds}, epoch {current_epoch}/{total_epoch}]")
+            print(
+                f"\tbest(before)={best_before['id']} | "
+                f"(λ={best_before.get('lambda_u', 0.0):.4f}, τ={best_before.get('threshold', 0.0):.4f}) | "
+                f"accuracy={best_before['accuracy']:.4f}, precision={best_before['precision']:.4f}, recall={best_before['recall']:.4f}, f1-score={best_before['f1_score']:.4f}"
+            )
+            print(
+                f"\tworst(before)={worst_before['id']} | "
+                f"(λ={worst_before.get('lambda_u', 0.0):.4f}, τ={worst_before.get('threshold', 0.0):.4f}) | "
+                f"accuracy={worst_before['accuracy']:.4f}, precision={worst_before['precision']:.4f}, recall={worst_before['recall']:.4f}, f1-score={worst_before['f1_score']:.4f}"
+            )
+            print(f"\tupdate(after)={', '.join(updates_log)}")
 
             with self.round_counter.get_lock():
                 self.round_counter.value += 1
@@ -253,8 +303,9 @@ class Explorer(mp.Process):
                 self.population_q.put(task)
 
 
+
 if __name__ == "__main__":
-    set_seed(42)
+    set_seed(BASE_SEED)
     reset_task_checkpoints(CHECKPOINT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -262,7 +313,7 @@ if __name__ == "__main__":
         labeled_path="./data/wm811k/preprocessing/labeled.pkl", unlabeled_path="./data/wm811k/preprocessing/unlabeled.pkl",
         train_ratio=0.75, val_ratio=0.15, test_ratio=0.10, label_ratio=LABEL_RATIO, image_size=96,
         cutout_num_holes=4, cutout_ratio=0.2, noise_prob=0.05,
-        data_seed=0)
+        data_seed=DATA_SEED)
 
     logger.info(f"train_labeled_dataset: {len(train_labeled_dataset)}")
     logger.info(f"val_dataset: {len(val_dataset)}")
@@ -297,23 +348,29 @@ if __name__ == "__main__":
                     checkpoints_dir=CHECKPOINT_DIR,
                     best_score=best_score,
                     best_lock=best_lock,
-                    device=device) for _ in range(NUM_WORKERS)
+                    device=device,
+                    base_seed=BASE_SEED) for _ in range(NUM_WORKERS)
                 ]
     
+    for i, worker in enumerate(workers):
+        worker.name = f"Worker-{i}"
+
     workers.append(Explorer(
                     round_counter=round_counter,
                     max_pbt_rounds=MAX_PBT_ROUNDS,
                     population_q=population_q,
                     finish_tasks_q=finish_tasks_q,
                     checkpoints_dir=CHECKPOINT_DIR,
-                    exploit_fraction=EXPLOIT_FRACTION)
-                    )
+                    exploit_fraction=EXPLOIT_FRACTION,
+                    base_seed=BASE_SEED))
     total_start = time.perf_counter()
 
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join()
+        print(f"{worker.name} alive={worker.is_alive()}, exitcode={worker.exitcode}", flush=True)
+
 
     tasks = []
     while not finish_tasks_q.empty():
@@ -330,15 +387,15 @@ if __name__ == "__main__":
     total_epochs_per_task = MAX_PBT_ROUNDS * PBT_INTERVAL
     total_task_epochs = POPULATION_SIZE * total_epochs_per_task
     
-    print(f"\nTuning time: {format_time(total_time)}\n")
-    print("[PBT Result]")
-    print(f"Best task={best_meta['id']} | round={best_meta['round']} | epoch={best_meta['epoch']} | "
-          f"(accuracy={best_meta['accuracy']:.4f}, precision={best_meta['precision']:.4f}, recall={best_meta['recall']:.4f}) | f1-score={best_meta['f1_score']:.4f} || "
-          f"lambda={best_ckpt.get('lambda_u'):.4f} | threshold={best_ckpt.get('threshold', 0.0):.4f}")
-    
-    print("Lambda history:", [round(x, 4) for x in best_meta.get("lambda_history", [])])
-    print("Threshold history:", [round(x, 4) for x in best_meta.get("threshold_history", [])])
-    print(f"Epochs: {total_epochs_per_task} per task | {total_task_epochs} task-epochs")
+    print("\n[PBT Result]")
+    print(f"\tTuning time: {format_time(total_time)}")
+    print(f"\tBest task={best_meta['id']} | round={best_meta['round']} | epoch={best_meta['epoch']}")
+    print(f"\tmetrics: accuracy={best_meta['accuracy']:.4f}, precision={best_meta['precision']:.4f}, recall={best_meta['recall']:.4f}, f1-score={best_meta['f1_score']:.4f}")
+    print(f"\thyperparams: λ={best_ckpt.get('lambda_u'):.4f}, τ={best_ckpt.get('threshold', 0.0):.4f}")
+
+    print(f"\tλ history:", [round(x, 4) for x in best_meta.get("lambda_history", [])])
+    print(f"\tτ history:", [round(x, 4) for x in best_meta.get("threshold_history", [])])
+    print(f"\tEpochs: {total_epochs_per_task} per task | {total_task_epochs} task-epochs\n")
     
 
 
