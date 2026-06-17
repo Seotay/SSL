@@ -1,4 +1,4 @@
-﻿import glob
+import glob
 import logging
 import os
 import queue
@@ -11,7 +11,7 @@ from torch import optim
 from dataset.dataset import get_wm811k, get_wm811k_loaders
 from model.model import ResnetModel
 from utils.trainer_pbt_v2 import PBT
-from utils.utils import format_time, set_seed, FocalLoss
+from utils.utils import format_time, set_seed, MultiTaskLossWeighting
 from torch.utils.data import DataLoader, SequentialSampler
 
 BASE_SEED = 42
@@ -23,12 +23,10 @@ BATCH_SIZE = 256
 MU = 4
 MAX_PBT_ROUNDS = 30 #30
 PBT_INTERVAL = 5 #5
-LABEL_RATIO = 1.00 #1.00
+LABEL_RATIO = 1
 INIT_HYPERPARAMETERS = {
-    "lambda_u": (0.1, 1, 10),
-    "threshold": (0.85, 0.90, 0.95),
-    "gamma": (1.0, 2.0 , 3.5),
-}
+    "threshold": (0.85, 0.90, 0.95)
+} 
 EXPLOIT_FRACTION = 0.2
 
 mp = _mp.get_context("spawn")
@@ -51,7 +49,7 @@ def best_metadata_path(checkpoints_dir):
 
 def reset_task_checkpoints(checkpoints_dir):
     os.makedirs(checkpoints_dir, exist_ok=True)
-
+    
     for ckpt_file in glob.glob(os.path.join(checkpoints_dir, "task-*.pth")):
         os.remove(ckpt_file)
 
@@ -61,78 +59,62 @@ def reset_task_checkpoints(checkpoints_dir):
 
 # Global function
 def initialize_population(population_q, population_size, init_hyperparameter, checkpoints_dir):
-    assert population_size == len(init_hyperparameter["lambda_u"]), \
-        "population_size must match the number of lambda candidates."
+
     assert population_size == len(init_hyperparameter["threshold"]), \
         "population_size must match the number of threshold candidates."
-    assert population_size == len(init_hyperparameter["gamma"]), \
-        "population_size must match the number of gamma candidates."
-
+    
     logs = []
-    for task_id, (lambda_u, threshold, gamma) in enumerate(zip(init_hyperparameter["lambda_u"], init_hyperparameter["threshold"], init_hyperparameter["gamma"])):
-
+    for task_id, (threshold) in enumerate(init_hyperparameter["threshold"]):
+        
         population_q.put({"id": task_id,
                           "accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1_score": 0.0,
-                          "lambda_u": float(lambda_u), "threshold": float(threshold), "gamma": float(gamma),
-                          "lambda_history": [float(lambda_u)], "threshold_history": [float(threshold)], "gamma_history": [float(gamma)]
+                          "threshold": float(threshold),
+                          "threshold_history": [float(threshold)]
                           })
 
         model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(torch.device("cpu"))
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
+        mtl_weighting = MultiTaskLossWeighting(num=2).to(torch.device("cpu"))
+        optimizer = optim.Adam([{"params": filter(lambda p: p.requires_grad, model.parameters()), "lr": 1e-3, "weight_decay": 1e-5},
+                                {"params": mtl_weighting.parameters(), "lr": 3e-4, "weight_decay": 0.0}
+                                ])
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, MAX_PBT_ROUNDS * PBT_INTERVAL))
         torch.save({"model_state_dict": model.state_dict(),
                     "optim_state_dict": optimizer.state_dict(),
+                    "mtl_state_dict": mtl_weighting.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "lambda_u": float(lambda_u),
-                    "threshold": float(threshold),
-                    "gamma": float(gamma)},
-                    population_checkpoint_path(checkpoints_dir, task_id))
-        logs.append(f"task {task_id}: λ={float(lambda_u):.3f}, τ={float(threshold):.3f}, γ={float(gamma):.3f}")
+                    "threshold": float(threshold)}, population_checkpoint_path(checkpoints_dir, task_id))
+        logs.append(f"task {task_id}: τ={float(threshold):.3f}")
 
     print("[PBT Initial] " + " | ".join(logs))
-    return init_hyperparameter["lambda_u"], init_hyperparameter["threshold"], init_hyperparameter["gamma"]
+    return init_hyperparameter["threshold"]
 
 # Global function
 def exploit_and_explore(top_checkpoint_path, bot_checkpoint_path,
-                              lambda_perturb=(0.8, 1.20), lambda_bounds=(0.0001, 1000),
-                              gamma_perturb = (0.85, 1.15), gamma_bounds=(0.5, 5.0),
                               threshold_steps=(-0.015, 0.015), threshold_bounds=(0.83, 0.98)):
     checkpoint = torch.load(top_checkpoint_path, map_location="cpu", weights_only=True)
     # Prefer current key `lambda_u`; keep `gamma` as backward-compatible fallback.
-    lambda_u = checkpoint.get("lambda_u")
     threshold = checkpoint.get("threshold")
-    gamma = checkpoint.get("gamma")
-
-    if lambda_u is not None:
-        perturb = np.random.choice(lambda_perturb)
-        lambda_u = float(lambda_u * perturb)
-        lambda_u = float(np.clip(lambda_u, lambda_bounds[0], lambda_bounds[1]))
-
+    
     if threshold is not None:
         threshold_step = np.random.choice(threshold_steps)
         threshold = float(threshold + threshold_step)
         threshold = float(np.clip(threshold, threshold_bounds[0], threshold_bounds[1]))
 
-    if gamma is not None:
-        perturb = np.random.choice(gamma_perturb)
-        gamma = float(gamma * perturb)
-        gamma = float(np.clip(gamma, gamma_bounds[0], gamma_bounds[1]))
-        checkpoint["gamma"] = gamma
-
-    checkpoint["lambda_u"] = lambda_u
-    checkpoint["gamma"] = gamma
+    
+    # Preserve legacy field for older training code paths that may still read `gamma`.
+    
     checkpoint["threshold"] = threshold
     torch.save(checkpoint, bot_checkpoint_path)
-    return lambda_u, threshold, gamma
+    return threshold
 
 # worker class
 class Worker(mp.Process):
-    def __init__(self, train_labeled_dataset, train_unlabeled_dataset,
+    def __init__(self, train_labeled_dataset, train_unlabeled_dataset, 
                  val_dataset, test_dataset, batch_size, mu, base_seed,
-                 pbt_interval, round_counter, max_pbt_rounds, population_q,
+                 pbt_interval, round_counter, max_pbt_rounds, population_q, 
                  finish_tasks_q, checkpoints_dir, best_score, best_lock, device):
         super().__init__()
-
+        
         # dataset
         self.train_labeled_dataset = train_labeled_dataset
         self.train_unlabeled_dataset = train_unlabeled_dataset
@@ -148,7 +130,7 @@ class Worker(mp.Process):
         # pbt
         self.population_q = population_q # queue for population of tasks to train
         self.finish_tasks_q = finish_tasks_q # queue for finished tasks
-
+        
         self.pbt_interval = pbt_interval
         self.round_counter = round_counter
         self.max_pbt_rounds = max_pbt_rounds
@@ -160,15 +142,17 @@ class Worker(mp.Process):
     def build_trainer(self):
         labeled_trainloader, unlabeled_trainloader, val_loader, test_loader = get_wm811k_loaders(self.train_labeled_dataset, self.train_unlabeled_dataset, self.val_dataset, self.test_dataset, self.batch_size, self.mu)
         model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=True).to(self.device)
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
+        mtl_weighting = MultiTaskLossWeighting(num=2).to(self.device)
+        optimizer = optim.Adam([{"params": filter(lambda p: p.requires_grad, model.parameters()), "lr": 1e-3, "weight_decay": 1e-5},
+                                {"params": mtl_weighting.parameters(), "lr": 3e-4, "weight_decay": 0.0}
+                                ])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, self.max_pbt_rounds * self.pbt_interval))
-        focal_loss = FocalLoss(gamma=1.5, reduction="none")
+        
         return PBT(model=model, labeled_trainloader=labeled_trainloader, unlabeled_trainloader=unlabeled_trainloader,
             val_loader=val_loader, test_loader=test_loader,
             epochs=self.pbt_interval, optimizer=optimizer,
-            scheduler=scheduler, early_stopping=None,
-            lambda_u=1.0,temperature=1.0, threshold=0.90,
-            focal_loss=focal_loss,
+            scheduler=scheduler, early_stopping=None, 
+            lambda_u=1.0, mtl_weighting=mtl_weighting, temperature=1.0, threshold=0.90, 
             use_amp=True, device=self.device)
 
     def run(self):
@@ -186,17 +170,17 @@ class Worker(mp.Process):
                 self.population_q.put(task_dict)
                 break
 
-
+            
             # Load checkpoint and hyperparameters for the task
             trainer.set_id(task_id = task_dict["id"])
             task_checkpoint_path = population_checkpoint_path(self.checkpoints_dir, trainer.task_id)
             trainer.load_checkpoint(task_checkpoint_path)
-
+            
             best_interval_score = -1.0
             best_interval_metrics = None
 
             for local_epoch in range(self.pbt_interval):
-                trainer.train_one_epoch(local_epoch)
+                _, train_metrics = trainer.train_one_epoch(local_epoch)
                 _, metrics = trainer.evaluate(data_loader=trainer.val_loader, loader_name="Validation Evaluating...")
 
                 global_epoch = self.round_counter.value * self.pbt_interval + local_epoch + 1
@@ -210,6 +194,7 @@ class Worker(mp.Process):
                     self.save_global_checkpoint(
                         task_dict=task_dict,
                         task_id=trainer.task_id,
+                        train_metrics=train_metrics,
                         metrics=metrics,
                         round_idx=self.round_counter.value + 1,
                         global_epoch=global_epoch,
@@ -219,16 +204,13 @@ class Worker(mp.Process):
             metrics = best_interval_metrics
             self.finish_tasks_q.put({
                 "id": trainer.task_id,
+                "alpha": float(train_metrics.get("alpha", 0.0)), "beta": float(train_metrics.get("beta", 0.0)),
                 "accuracy": float(metrics["accuracy"]), "precision": float(metrics["precision"]), "recall": float(metrics["recall"]), "f1_score": float(metrics["f1"]),
-                "lambda_u": float(trainer.lambda_u),
                 "threshold": float(trainer.threshold),
-                "gamma": float(trainer.focal_loss.gamma),
-                "lambda_history": task_dict.get("lambda_history", []),
-                "threshold_history": task_dict.get("threshold_history", []),
-                "gamma_history": task_dict.get("gamma_history", [])
+                "threshold_history": task_dict.get("threshold_history", [])
                 })
 
-    def save_global_checkpoint(self, task_dict, task_id, metrics, global_epoch, round_idx, task_checkpoint_path):
+    def save_global_checkpoint(self, task_dict, task_id, train_metrics, metrics, global_epoch, round_idx, task_checkpoint_path):
         with self.best_lock:
             if float(metrics["f1"]) <= self.best_score.value:
                 return
@@ -237,14 +219,10 @@ class Worker(mp.Process):
 
             shutil.copyfile(task_checkpoint_path, best_checkpoint_path(self.checkpoints_dir))
             torch.save({"id": int(task_id), "accuracy": float(metrics["accuracy"]), "precision": float(metrics["precision"]), "recall": float(metrics["recall"]), "f1_score": float(metrics["f1"]),
-                    "lambda_u": float(self._get_task_value(task_dict, "lambda_u")),
+                    "alpha": float(train_metrics.get("alpha", 0.0)), "beta": float(train_metrics.get("beta", 0.0)),
                     "threshold": float(self._get_task_value(task_dict, "threshold")),
-                    "gamma": float(self._get_task_value(task_dict, "gamma")),
-                    "lambda_history": [float(x) for x in task_dict.get("lambda_history", [])],
                     "threshold_history": [float(x) for x in task_dict.get("threshold_history", [])],
-                    "gamma_history": [float(x) for x in task_dict.get("gamma_history", [])],
-                    "round": int(round_idx), "epoch": int(global_epoch)},
-                    best_metadata_path(self.checkpoints_dir))
+                    "round": int(round_idx), "epoch": int(global_epoch)}, best_metadata_path(self.checkpoints_dir))
 
     def _get_task_value(self, task_dict, key):
         return task_dict.get(key, 0.0)
@@ -262,7 +240,7 @@ class Explorer(mp.Process):
         self.exploit_fraction = exploit_fraction
         self.base_seed = base_seed
 
-    def run(self):
+    def run(self):  
         set_seed(self.base_seed)
         while self.round_counter.value < self.max_pbt_rounds:
             if not (self.population_q.empty() and self.finish_tasks_q.full()):
@@ -279,43 +257,42 @@ class Explorer(mp.Process):
             bottoms = tasks[-cutoff:]
             best_before = dict(tasks[0])
             worst_before = dict(tasks[-1])
+
             round_idx = self.round_counter.value + 1
             updates_log = []
             for bottom in bottoms:
                 top = tops[np.random.randint(len(tops))]
-                updated_lambda, updated_threshold, updated_gamma = exploit_and_explore(
+                updated_threshold = exploit_and_explore(
                     population_checkpoint_path(self.checkpoints_dir, top["id"]),
                     population_checkpoint_path(self.checkpoints_dir, bottom["id"]),
                 )
 
-                if updated_lambda is None:
-                    updated_lambda = top.get("lambda_u", bottom.get("lambda_u", 0.2))
                 if updated_threshold is None:
                     updated_threshold = top.get("threshold", bottom.get("threshold", 0.90))
-                if updated_gamma is None:
-                    updated_gamma = top.get("gamma", bottom.get("gamma", 2.0))
 
-                bottom["lambda_u"] = float(updated_lambda)
+                
                 bottom["threshold"] = float(updated_threshold)
-                bottom["gamma"] = float(updated_gamma)
-                bottom.setdefault("lambda_history", []).append(float(updated_lambda))
                 bottom.setdefault("threshold_history", []).append(float(updated_threshold))
-                bottom.setdefault("gamma_history", []).append(float(updated_gamma))
-                updates_log.append(f"{bottom['id']} <- {top['id']}(λ={float(updated_lambda):.4f}, τ={float(updated_threshold):.4f}, γ={float(updated_gamma):.4f})")
+                updates_log.append(f"{bottom['id']} <- {top['id']}(τ={float(updated_threshold):.4f})")
 
             current_epoch = round_idx * PBT_INTERVAL
             total_epoch = self.max_pbt_rounds * PBT_INTERVAL
 
-
+            
             print(f"\n[PBT Round {round_idx}/{self.max_pbt_rounds}, epoch {current_epoch}/{total_epoch}]")
             print(
                 f"\tbest(before)={best_before['id']} | "
-                f"(λ={best_before.get('lambda_u', 0.0):.4f}, τ={best_before.get('threshold', 0.0):.4f}, γ={best_before.get('gamma', 0.0):.4f}) | "
+                f"(τ={best_before.get('threshold', 0.0):.4f}) | "
+                f"alpha={best_before.get('alpha', 0.0):.4f}, "
+                f"beta={best_before.get('beta', 0.0):.4f}, "
                 f"accuracy={best_before['accuracy']:.4f}, precision={best_before['precision']:.4f}, recall={best_before['recall']:.4f}, f1-score={best_before['f1_score']:.4f}"
             )
+
             print(
                 f"\tworst(before)={worst_before['id']} | "
-                f"(λ={worst_before.get('lambda_u', 0.0):.4f}, τ={worst_before.get('threshold', 0.0):.4f}, γ={worst_before.get('gamma', 0.0):.4f}) | "
+                f"(τ={worst_before.get('threshold', 0.0):.4f}) | "
+                f"alpha={worst_before.get('alpha', 0.0):.4f}, "
+                f"beta={worst_before.get('beta', 0.0):.4f}, "
                 f"accuracy={worst_before['accuracy']:.4f}, precision={worst_before['precision']:.4f}, recall={worst_before['recall']:.4f}, f1-score={worst_before['f1_score']:.4f}"
             )
             print(f"\tupdate(after)={', '.join(updates_log)}")
@@ -353,10 +330,10 @@ if __name__ == "__main__":
 
 
 
-    init_lambdas, init_thresholds, init_gammas = initialize_population(population_q=population_q, population_size=POPULATION_SIZE,
+    init_thresholds = initialize_population(population_q=population_q, population_size=POPULATION_SIZE, 
                                                           init_hyperparameter=INIT_HYPERPARAMETERS, checkpoints_dir=CHECKPOINT_DIR)
 
-
+    
     workers = [Worker(
                     train_labeled_dataset=train_labeled_dataset,
                     train_unlabeled_dataset=train_unlabeled_dataset,
@@ -364,7 +341,6 @@ if __name__ == "__main__":
                     test_dataset=test_dataset,
                     batch_size=BATCH_SIZE,
                     mu=MU,
-                    base_seed=BASE_SEED,
                     pbt_interval=PBT_INTERVAL,
                     round_counter=round_counter,
                     max_pbt_rounds=MAX_PBT_ROUNDS,
@@ -374,9 +350,9 @@ if __name__ == "__main__":
                     best_score=best_score,
                     best_lock=best_lock,
                     device=device,
-                    ) for _ in range(NUM_WORKERS)
+                    base_seed=BASE_SEED) for _ in range(NUM_WORKERS)
                 ]
-
+    
     for i, worker in enumerate(workers):
         worker.name = f"Worker-{i}"
 
@@ -388,8 +364,6 @@ if __name__ == "__main__":
                     checkpoints_dir=CHECKPOINT_DIR,
                     exploit_fraction=EXPLOIT_FRACTION,
                     base_seed=BASE_SEED))
-
-
     total_start = time.perf_counter()
 
     for worker in workers:
@@ -404,42 +378,38 @@ if __name__ == "__main__":
         tasks.append(finish_tasks_q.get())
     while not population_q.empty():
         tasks.append(population_q.get())
-
+    
     total_time = time.perf_counter() - total_start
-
+    
     # Print final results
     tasks = sorted(tasks, key=lambda x: x["f1_score"], reverse=True)
     best_meta = torch.load(best_metadata_path(CHECKPOINT_DIR), map_location="cpu", weights_only=True)
     best_ckpt = torch.load(best_checkpoint_path(CHECKPOINT_DIR), map_location="cpu", weights_only=True)
     total_epochs_per_task = MAX_PBT_ROUNDS * PBT_INTERVAL
     total_task_epochs = POPULATION_SIZE * total_epochs_per_task
-
+    
     print("\n[PBT Result]")
     print(f"\tTuning time: {format_time(total_time)}")
     print(f"\tBest task={best_meta['id']} | round={best_meta['round']} | epoch={best_meta['epoch']}")
     print(f"\tmetrics: accuracy={best_meta['accuracy']:.4f}, precision={best_meta['precision']:.4f}, recall={best_meta['recall']:.4f}, f1-score={best_meta['f1_score']:.4f}")
-    print(f"\thyperparams: λ={best_ckpt.get('lambda_u'):.4f}, τ={best_ckpt.get('threshold', 0.0):.4f}, γ={best_ckpt.get('gamma', 0.0):.4f}")
-    print(f"\tλ history:", [round(x, 4) for x in best_meta.get("lambda_history", [])])
-    print(f"\tτ history:", [round(x, 4) for x in best_meta.get("threshold_history", [])])
-    print(f"\tγ history:", [round(x, 4) for x in best_meta.get("gamma_history", [])])
-    print(f"\tEpochs: {total_epochs_per_task} per task | {total_task_epochs} task-epochs\n")
+    print(f"\thyperparams: τ={best_ckpt.get('threshold', 0.0):.4f}, "f"alpha={best_meta.get('alpha', 0.0):.4f}, "f"beta={best_meta.get('beta', 0.0):.4f}")
 
+    print(f"\tτ history:", [round(x, 4) for x in best_meta.get("threshold_history", [])])
+    print(f"\tEpochs: {total_epochs_per_task} per task | {total_task_epochs} task-epochs\n")
+    
 
 
     # Test the best model on the test data
-    val_loader = DataLoader(val_dataset,sampler=SequentialSampler(val_dataset), batch_size=BATCH_SIZE, drop_last=False)
-    test_loader = DataLoader(test_dataset,sampler=SequentialSampler(test_dataset), batch_size=BATCH_SIZE, drop_last=False)
+    val_loader = DataLoader(val_dataset, sampler=SequentialSampler(val_dataset), batch_size=BATCH_SIZE, drop_last=False)
+    test_loader = DataLoader(test_dataset, sampler=SequentialSampler(test_dataset), batch_size=BATCH_SIZE, drop_last=False)
     best_model = ResnetModel(model_name="resnet18", num_classes=9, pretrained=False).to(device)
-    focal_loss = FocalLoss(gamma=best_ckpt.get("gamma", 1.0), reduction="none")
-    best_optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, best_model.parameters()),
-        lr=1e-3,
-        weight_decay=1e-5,
-    )
-
+    mtl_weighting = MultiTaskLossWeighting(num=2).to(device)
+    best_optimizer = optim.Adam([{"params": filter(lambda p: p.requires_grad, best_model.parameters()), "lr": 1e-3, "weight_decay": 1e-5},
+                                {"params": mtl_weighting.parameters(), "lr": 3e-4, "weight_decay": 0.0}
+                                ])
     best_trainer = PBT(model=best_model, labeled_trainloader=None, unlabeled_trainloader=None, val_loader=val_loader,
         test_loader=test_loader, epochs=0, optimizer=best_optimizer,
-        scheduler=None, early_stopping=None, lambda_u=0.2, temperature=1.0, threshold=0.90, focal_loss=focal_loss, use_amp=True, device=device)
+        scheduler=None, early_stopping=None, lambda_u=1.0, mtl_weighting=mtl_weighting, temperature=1.0, threshold=0.90, use_amp=True, device=device)
     best_trainer.load_checkpoint(best_checkpoint_path(CHECKPOINT_DIR))
     best_trainer._evaluate_and_log(best_trainer.val_loader, "Best PBT Validation")
     best_trainer._evaluate_and_log(best_trainer.test_loader, "Best PBT Test")

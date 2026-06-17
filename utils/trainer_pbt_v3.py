@@ -9,6 +9,7 @@ class Trainer:
         val_loader, test_loader, epochs, optimizer, 
         early_stopping=None, device=None, scheduler=None, lambda_u=1.0,
         mtl_weighting=1.0, temperature=1.0, threshold=0.95,
+        num_classes=9, majority_class=8, threshold_update_every=3,
         use_amp=True,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,6 +28,14 @@ class Trainer:
         self.mtl_weighting = mtl_weighting
         self.temperature = temperature
         self.threshold = threshold
+
+        # adsh
+        self.num_classes = num_classes
+        self.majority_class = majority_class
+        self.threshold_update_every = threshold_update_every
+        self.class_thresholds = torch.full((self.num_classes, ), self.threshold, device=self.device)
+
+
         self.use_amp = use_amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
@@ -46,9 +55,13 @@ class Trainer:
         assert self.val_loader is not None, "val_loader must be provided."
 
         for epoch in range(self.epochs):
+            if (epoch + 1) % self.threshold_update_every == 0:
+                self.update_thresholds(epoch)
             train_loss, train_metrics = self.train_one_epoch(epoch)
             val_loss, val_metrics = self.evaluate(data_loader=self.val_loader, loader_name="Validation Evaluating...")
             self._print_epoch_summary(epoch, train_loss, train_metrics, val_loss, val_metrics)
+            
+
 
             # Early stopping check
             self.early_stopping(val_metrics["f1"], self.model)
@@ -69,6 +82,60 @@ class Trainer:
         self._evaluate_and_log(self.labeled_trainloader, "Best Model Train")
         self._evaluate_and_log(self.val_loader, "Best Model Validation")
         self._evaluate_and_log(self.test_loader, "Test")
+
+    @torch.no_grad()
+    def update_thresholds(self, epoch):
+        self.model.eval()
+
+        C = [[] for _ in range(self.num_classes)]
+        for unlabeled_batch in tqdm(self.unlabeled_trainloader, desc="Updating Thresholds", leave=False):
+            (inputs_u_w, _), _ = unlabeled_batch
+            inputs_u_w = inputs_u_w.to(self.device)
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                logits_u_w = self.model(inputs_u_w)
+                prob_u_w = torch.softmax(logits_u_w.detach() / self.temperature, dim=-1)
+
+            max_probs, pseudo_labels = torch.max(prob_u_w, dim=-1)
+            max_probs = max_probs.cpu()
+            pseudo_labels = pseudo_labels.cpu()
+
+            for conf, cls in zip(max_probs, pseudo_labels):
+                C[int(cls.item())].append(float(conf.item()))
+
+        # majority class=8
+        C_majority = sorted(C[self.majority_class], reverse=True)
+        if len(C_majority) == 0:
+            print("No pseudo-labels for majority class. Skipping threshold update.")
+            self.class_thresholds = torch.full((self.num_classes,), self.threshold, device=self.device)
+            return
+        
+        rho = sum(conf >= self.threshold for conf in C_majority) / len(C_majority)
+
+        tau_k_list  = []
+        for k in range(self.num_classes):
+            Ck = sorted(C[k], reverse=True)
+
+            if len(Ck) == 0:
+                tau_k = self.threshold
+            
+            elif rho <=0:
+                tau_k = 1.0
+            
+            elif k == self.majority_class:
+                tau_k = self.threshold
+            
+            else:
+                idx = int(torch.ceil(torch.tensor(rho * len(Ck))).item()) - 1
+                idx = max(0, min(idx, len(Ck) - 1))
+                tau_k = Ck[idx]
+
+            tau_k_list.append(tau_k)        
+    
+        self.class_thresholds = torch.tensor(tau_k_list, dtype=torch.float32, device=self.device)
+        self.class_thresholds = torch.clamp(self.class_thresholds, min=1e-12, max=1.0)
+        #print(f"[Epoch {epoch + 1}] rho: {rho:.2f}, "f"Updated Thresholds: {self.class_thresholds.detach().cpu().numpy().round(2)}")
+
 
 
     def train_one_epoch(self, epoch=None):
@@ -101,10 +168,11 @@ class Trainer:
                 with torch.no_grad():
                     logits_u_w = self.model(inputs_u_w) # [B*mu, num_classes]
                     prob_u_w = torch.softmax(logits_u_w.detach() / self.temperature, dim=-1) # [B*mu, num_classes]
-                    max_probs, pesudo_labels = torch.max(prob_u_w, dim=-1) # max_probs: [B*mu, 1], pesudo_labels: [B*mu, 1]
-                    mask = max_probs.ge(self.threshold).float() # [B*mu, 1]: True / False
+                    max_probs, pseudo_labels = torch.max(prob_u_w, dim=-1) # max_probs: [B*mu, 1], pseudo_labels: [B*mu, 1]
+                    tau_k = self.class_thresholds[pseudo_labels]
+                    mask = max_probs.ge(tau_k).float() # [B*mu, 1]: True / False
                 
-                loss_u = (F.cross_entropy(logits_u_s, pesudo_labels, reduction="none") * mask).mean()
+                loss_u = (F.cross_entropy(logits_u_s, pseudo_labels, reduction="none") * mask).mean()
                 loss, alpha, beta = self.mtl_weighting(loss_s=loss_x, loss_u=loss_u)
 
             if self.use_amp:
@@ -202,6 +270,7 @@ class PBT(Trainer):
             "mtl_state_dict": self.mtl_weighting.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
             "threshold": float(self.threshold),
+            "class_thresholds": self.class_thresholds.detach().cpu(),
             "model_name": getattr(self.model, "model_name", None),
         }
         torch.save(checkpoint, checkpoint_path)
@@ -214,7 +283,11 @@ class PBT(Trainer):
         if self.scheduler is not None and ckpt["scheduler_state_dict"] is not None:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         self.threshold = float(ckpt.get("threshold", self.threshold))
-
+        
+        if "class_thresholds" in ckpt:
+            self.class_thresholds = ckpt["class_thresholds"].to(self.device)
+        else:
+            self.class_thresholds = torch.full((self.num_classes,), self.threshold, device=self.device)
     def set_id(self, task_id):
         self.task_id = task_id
 
@@ -224,5 +297,7 @@ class PBT(Trainer):
 
     def training_pbt(self, num_epochs):
         for epoch in range(num_epochs):
+            if (epoch + 1) % self.threshold_update_every == 0:
+                self.update_thresholds(epoch)
             _, train_metrics = self.train_one_epoch(epoch)
-
+            

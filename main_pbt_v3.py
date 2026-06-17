@@ -23,11 +23,14 @@ BATCH_SIZE = 256
 MU = 4
 MAX_PBT_ROUNDS = 30 #30
 PBT_INTERVAL = 5 #5
-LABEL_RATIO = 1
+LABEL_RATIO = 1.00
 INIT_HYPERPARAMETERS = {
     "threshold": (0.85, 0.90, 0.95)
 } 
 EXPLOIT_FRACTION = 0.2
+
+THRESHOLD_UPDATE_EVERY = 10
+
 
 mp = _mp.get_context("spawn")
 logger = logging.getLogger()
@@ -78,11 +81,15 @@ def initialize_population(population_q, population_size, init_hyperparameter, ch
                                 {"params": mtl_weighting.parameters(), "lr": 3e-4, "weight_decay": 0.0}
                                 ])
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, MAX_PBT_ROUNDS * PBT_INTERVAL))
-        torch.save({"model_state_dict": model.state_dict(),
-                    "optim_state_dict": optimizer.state_dict(),
-                    "mtl_state_dict": mtl_weighting.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "threshold": float(threshold)}, population_checkpoint_path(checkpoints_dir, task_id))
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "optim_state_dict": optimizer.state_dict(),
+            "mtl_state_dict": mtl_weighting.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "threshold": float(threshold),
+            "class_thresholds": torch.full((9,), float(threshold)),
+        }, population_checkpoint_path(checkpoints_dir, task_id))
+                    
         logs.append(f"task {task_id}: τ={float(threshold):.3f}")
 
     print("[PBT Initial] " + " | ".join(logs))
@@ -153,6 +160,7 @@ class Worker(mp.Process):
             epochs=self.pbt_interval, optimizer=optimizer,
             scheduler=scheduler, early_stopping=None, 
             lambda_u=1.0, mtl_weighting=mtl_weighting, temperature=1.0, threshold=0.90, 
+            num_classes=9, majority_class=8, threshold_update_every=THRESHOLD_UPDATE_EVERY,
             use_amp=True, device=self.device)
 
     def run(self):
@@ -179,11 +187,15 @@ class Worker(mp.Process):
             best_interval_score = -1.0
             best_interval_metrics = None
 
-            for local_epoch in range(self.pbt_interval):
-                _, train_metrics = trainer.train_one_epoch(local_epoch)
-                _, metrics = trainer.evaluate(data_loader=trainer.val_loader, loader_name="Validation Evaluating...")
-
+            for local_epoch in range(self.pbt_interval):                
                 global_epoch = self.round_counter.value * self.pbt_interval + local_epoch + 1
+
+                if global_epoch % trainer.threshold_update_every == 0:
+                    trainer.update_thresholds(global_epoch - 1)
+
+                _, train_metrics = trainer.train_one_epoch(local_epoch)
+                _, metrics = trainer.evaluate(data_loader=trainer.val_loader, loader_name="Validation Evaluating...")                
+                
                 current_f1 = float(metrics["f1"])
 
                 if current_f1 > best_interval_score:
@@ -196,6 +208,7 @@ class Worker(mp.Process):
                         task_id=trainer.task_id,
                         train_metrics=train_metrics,
                         metrics=metrics,
+                        class_thresholds=trainer.class_thresholds.detach().cpu().tolist(),
                         round_idx=self.round_counter.value + 1,
                         global_epoch=global_epoch,
                         task_checkpoint_path=task_checkpoint_path,
@@ -210,7 +223,7 @@ class Worker(mp.Process):
                 "threshold_history": task_dict.get("threshold_history", [])
                 })
 
-    def save_global_checkpoint(self, task_dict, task_id, train_metrics, metrics, global_epoch, round_idx, task_checkpoint_path):
+    def save_global_checkpoint(self, task_dict, task_id, train_metrics, metrics, class_thresholds,global_epoch, round_idx, task_checkpoint_path):
         with self.best_lock:
             if float(metrics["f1"]) <= self.best_score.value:
                 return
@@ -221,6 +234,7 @@ class Worker(mp.Process):
             torch.save({"id": int(task_id), "accuracy": float(metrics["accuracy"]), "precision": float(metrics["precision"]), "recall": float(metrics["recall"]), "f1_score": float(metrics["f1"]),
                     "alpha": float(train_metrics.get("alpha", 0.0)), "beta": float(train_metrics.get("beta", 0.0)),
                     "threshold": float(self._get_task_value(task_dict, "threshold")),
+                    "class_thresholds": [float(x) for x in class_thresholds],
                     "threshold_history": [float(x) for x in task_dict.get("threshold_history", [])],
                     "round": int(round_idx), "epoch": int(global_epoch)}, best_metadata_path(self.checkpoints_dir))
 
@@ -393,7 +407,7 @@ if __name__ == "__main__":
     print(f"\tBest task={best_meta['id']} | round={best_meta['round']} | epoch={best_meta['epoch']}")
     print(f"\tmetrics: accuracy={best_meta['accuracy']:.4f}, precision={best_meta['precision']:.4f}, recall={best_meta['recall']:.4f}, f1-score={best_meta['f1_score']:.4f}")
     print(f"\thyperparams: τ={best_ckpt.get('threshold', 0.0):.4f}, "f"alpha={best_meta.get('alpha', 0.0):.4f}, "f"beta={best_meta.get('beta', 0.0):.4f}")
-
+    print("\tclass thresholds:", [round(x, 4) for x in best_meta.get("class_thresholds", [])])
     print(f"\tτ history:", [round(x, 4) for x in best_meta.get("threshold_history", [])])
     print(f"\tEpochs: {total_epochs_per_task} per task | {total_task_epochs} task-epochs\n")
     
@@ -409,7 +423,9 @@ if __name__ == "__main__":
                                 ])
     best_trainer = PBT(model=best_model, labeled_trainloader=None, unlabeled_trainloader=None, val_loader=val_loader,
         test_loader=test_loader, epochs=0, optimizer=best_optimizer,
-        scheduler=None, early_stopping=None, lambda_u=1.0, mtl_weighting=mtl_weighting, temperature=1.0, threshold=0.90, use_amp=True, device=device)
+        scheduler=None, early_stopping=None, lambda_u=1.0, mtl_weighting=mtl_weighting, temperature=1.0, threshold=0.90, 
+        num_classes=9, majority_class=8, threshold_update_every=THRESHOLD_UPDATE_EVERY, 
+        use_amp=True, device=device)
     best_trainer.load_checkpoint(best_checkpoint_path(CHECKPOINT_DIR))
     best_trainer._evaluate_and_log(best_trainer.val_loader, "Best PBT Validation")
     best_trainer._evaluate_and_log(best_trainer.test_loader, "Best PBT Test")
